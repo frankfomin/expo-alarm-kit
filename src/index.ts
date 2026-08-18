@@ -79,6 +79,13 @@ export interface ScheduleAlarmOptions {
   tintColor?: string;
   /** Snooze duration in seconds (default: 540 = 9 minutes) */
   snoozeDuration?: number;
+  /**
+   * When set, dismissing the alarm without opening the app will automatically reschedule it
+   * this many seconds later. The next alarm uses the same title, sound, and button config.
+   * Dismissing the rescheduled alarm also reschedules — this repeats indefinitely until the
+   * alarm is cancelled via cancelAlarm() or the user opens the app and stops it from JS.
+   */
+  rescheduleDelaySeconds?: number;
 }
 
 /**
@@ -144,6 +151,12 @@ export interface ScheduleRepeatingAlarmOptions {
   tintColor?: string;
   /** Snooze duration in seconds (default: 540 = 9 minutes) */
   snoozeDuration?: number;
+  /**
+   * When set, dismissing the alarm without opening the app reschedules a one-time alarm
+   * this many seconds later. Repeats indefinitely until the user opens the app and cancels.
+   * This is the "keep bugging them until they complete the challenge" mechanism.
+   */
+  rescheduleDelaySeconds?: number;
 }
 
 /**
@@ -233,6 +246,39 @@ export function getLaunchPayload(): LaunchPayload | null {
   return ExpoAlarmKitModule.getLaunchPayload();
 }
 
+export interface RescheduledAlarm {
+  /** The alarm ID that was dismissed */
+  originalAlarmId: string;
+  /** The new alarm ID that was scheduled in the background */
+  newAlarmId: string;
+}
+
+/**
+ * Returns alarms that were rescheduled in the background while the app was closed.
+ * Call this on app launch to update your local alarm state with the new IDs.
+ * Always follow up with clearPendingRescheduledAlarms() after consuming the list.
+ *
+ * @example
+ * ```typescript
+ * const rescheduled = getPendingRescheduledAlarms();
+ * for (const { originalAlarmId, newAlarmId } of rescheduled) {
+ *   myAlarmStore.replaceId(originalAlarmId, newAlarmId);
+ * }
+ * clearPendingRescheduledAlarms();
+ * ```
+ */
+export function getPendingRescheduledAlarms(): RescheduledAlarm[] {
+  return ExpoAlarmKitModule.getPendingRescheduledAlarms();
+}
+
+/**
+ * Clear pending rescheduled alarm mappings after consuming them.
+ * Call this immediately after getPendingRescheduledAlarms().
+ */
+export function clearPendingRescheduledAlarms(): void {
+  ExpoAlarmKitModule.clearPendingRescheduledAlarms();
+}
+
 // Default export object for namespace-style usage
 const ExpoAlarmKit = {
   configure,
@@ -246,6 +292,8 @@ const ExpoAlarmKit = {
   clearAllAlarms,
   removeAlarm,
   getLaunchPayload,
+  getPendingRescheduledAlarms,
+  clearPendingRescheduledAlarms,
 };
 
 export default ExpoAlarmKit;

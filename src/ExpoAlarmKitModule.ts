@@ -23,6 +23,7 @@ export interface ScheduleAlarmOptions {
   snoozeButtonColor?: string | null;
   tintColor?: string | null;
   snoozeDuration?: number | null;
+  rescheduleDelaySeconds?: number | null;
 }
 
 export interface ScheduleRepeatingAlarmOptions {
@@ -43,6 +44,7 @@ export interface ScheduleRepeatingAlarmOptions {
   snoozeButtonColor?: string | null;
   tintColor?: string | null;
   snoozeDuration?: number | null;
+  rescheduleDelaySeconds?: number | null;
 }
 
 export interface ScheduleTimerOptions {
@@ -125,6 +127,18 @@ interface ExpoAlarmKitModuleType {
    * This resets the list of alarm IDs stored in UserDefaults.
    */
   clearAllAlarms(): void;
+
+  /**
+   * Get alarms that were rescheduled in the background while the app was closed.
+   * Returns an array of { originalAlarmId, newAlarmId } mappings.
+   * Call clearPendingRescheduledAlarms() after consuming these.
+   */
+  getPendingRescheduledAlarms(): { originalAlarmId: string; newAlarmId: string }[];
+
+  /**
+   * Clear the pending rescheduled alarm mappings after they have been consumed.
+   */
+  clearPendingRescheduledAlarms(): void;
 
   /**
    * Get the launch payload if the app was opened from an alarm dismiss/snooze intent.

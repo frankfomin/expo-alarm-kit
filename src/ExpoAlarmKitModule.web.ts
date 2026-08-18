@@ -1,4 +1,4 @@
-import { registerWebModule, NativeModule } from 'expo';
+import { registerWebModule, NativeModule } from 'expo-modules-core';
 
 export type AuthorizationStatus = 'authorized' | 'denied' | 'notDetermined';
 
