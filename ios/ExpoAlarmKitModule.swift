@@ -220,7 +220,7 @@ public struct AlarmDismissIntent: LiveActivityIntent {
         ExpoAlarmKitStorage.appGroupIdentifier = self.appGroupIdentifier
 
         if let config = ExpoAlarmKitStorage.getRescheduleConfig(alarmId: self.alarmId) {
-            await rescheduleAlarmInBackground(config: config, originalAlarmId: self.alarmId)
+            await rescheduleAlarmInBackground(config: config)
         }
 
         ExpoAlarmKitStorage.removeAlarm(id: self.alarmId)
@@ -252,7 +252,7 @@ public struct PersistentAlarmConfig: Codable {
 
 // Schedules a new alarm from within an AppIntent perform() — runs without opening the app.
 @available(iOS 26.0, *)
-private func rescheduleAlarmInBackground(config: PersistentAlarmConfig, originalAlarmId: String) async {
+private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async {
     struct Meta: AlarmMetadata {}
 
     let newAlarmId = UUID()
@@ -330,7 +330,10 @@ private func rescheduleAlarmInBackground(config: PersistentAlarmConfig, original
         ExpoAlarmKitStorage.setAlarm(id: newAlarmIdString, value: fireDate.timeIntervalSince1970)
         // Carry the reschedule config forward so the next dismiss also reschedules
         let nextConfig = PersistentAlarmConfig(
-            originalAlarmId: newAlarmIdString,
+            // Carry the ROOT id, not this hop's id. This field identifies the
+            // alarm the user actually created; overwriting it each hop turns
+            // the mappings below into a chain JS has to walk in order.
+            originalAlarmId: config.originalAlarmId,
             title: config.title,
             soundName: config.soundName,
             rescheduleDelaySeconds: config.rescheduleDelaySeconds,
@@ -348,7 +351,7 @@ private func rescheduleAlarmInBackground(config: PersistentAlarmConfig, original
         )
         ExpoAlarmKitStorage.setRescheduleConfig(alarmId: newAlarmIdString, config: nextConfig)
         // Record mapping so JS can reconcile alarm IDs when it next opens
-        ExpoAlarmKitStorage.setRescheduled(originalAlarmId: originalAlarmId, newAlarmId: newAlarmIdString)
+        ExpoAlarmKitStorage.setRescheduled(originalAlarmId: config.originalAlarmId, newAlarmId: newAlarmIdString)
     } catch {
         print("[ExpoAlarmKit] Background reschedule failed: \(error)")
     }
@@ -383,7 +386,7 @@ public struct AlarmDismissIntentWithLaunch: LiveActivityIntent {
         ExpoAlarmKitModule.launchPayload = buildLaunchPayload(alarmId: self.alarmId, payload: self.payload)
 
         if let config = ExpoAlarmKitStorage.getRescheduleConfig(alarmId: self.alarmId) {
-            await rescheduleAlarmInBackground(config: config, originalAlarmId: self.alarmId)
+            await rescheduleAlarmInBackground(config: config)
         }
 
         ExpoAlarmKitStorage.removeAlarm(id: self.alarmId)
