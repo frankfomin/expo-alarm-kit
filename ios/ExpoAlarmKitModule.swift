@@ -270,9 +270,23 @@ private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async {
     // No snooze button. `.countdown` snoozes natively without running any
     // intent, so the app never learns the alarm fired — no mapping, no
     // challenge. Stop is the only exit, and Stop always runs AlarmDismissIntent.
+    let snoozeLabel = config.snoozeButtonLabel ?? "Snooze"
+    let snoozeColor = config.snoozeButtonColor != nil ? colorFromHex(config.snoozeButtonColor!) : Color.white
+    let snoozeButton = AlarmButton(
+        text: LocalizedStringResource(stringLiteral: snoozeLabel),
+        textColor: snoozeColor,
+        systemImageName: "stop.circle"
+    )
+
+    // AlarmKit always renders a secondary button, so it can't be removed.
+    // Wire it to the same dismiss intent as Stop: `.custom` runs our intent
+    // instead of AlarmKit's native countdown, so whichever button the user taps
+    // the alarm reschedules and a mapping is written.
     let alertPresentation = AlarmPresentation.Alert(
         title: LocalizedStringResource(stringLiteral: config.title),
-        stopButton: stopButton
+        stopButton: stopButton,
+        secondaryButton: snoozeButton,
+        secondaryButtonBehavior: .custom
     )
     let presentation = AlarmPresentation(alert: alertPresentation)
 
@@ -300,14 +314,10 @@ private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async {
         ? AlarmDismissIntentWithLaunch(alarmId: newAlarmIdString, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
         : AlarmDismissIntent(alarmId: newAlarmIdString, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
 
-    let secondaryIntent: (any LiveActivityIntent)?
-    if config.doSnoozeIntent {
-        secondaryIntent = config.launchAppOnSnooze
-            ? AlarmSnoozeIntentWithLaunch(alarmId: newAlarmIdString, payload: config.snoozePayload)
-            : AlarmSnoozeIntent(alarmId: newAlarmIdString, payload: config.snoozePayload)
-    } else {
-        secondaryIntent = nil
-    }
+    // Same intent as Stop — snooze must not be a way out of the challenge.
+    let secondaryIntent: (any LiveActivityIntent)? = config.launchAppOnDismiss
+        ? AlarmDismissIntentWithLaunch(alarmId: newAlarmIdString, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
+        : AlarmDismissIntent(alarmId: newAlarmIdString, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
 
     let alarmConfig = AlarmManager.AlarmConfiguration<Meta>(
         countdownDuration: countdownDuration,
@@ -522,8 +532,6 @@ public class ExpoAlarmKitModule: Module {
                 return false
             }
             let launchAppOnDismiss = options.launchAppOnDismiss ?? false
-            let doSnoozeIntent = options.doSnoozeIntent ?? false
-            let launchAppOnSnooze = options.launchAppOnSnooze ?? false
             
             // Create stop button
             let stopLabel = options.stopButtonLabel ?? "Stop"
@@ -535,9 +543,23 @@ public class ExpoAlarmKitModule: Module {
             )
             
             // No snooze button — see the note in rescheduleAlarmInBackground.
+            let snoozeLabel = options.snoozeButtonLabel ?? "Snooze"
+            let snoozeColor = options.snoozeButtonColor != nil ? colorFromHex(options.snoozeButtonColor!) : Color.white
+            let snoozeButton = AlarmButton(
+                text: LocalizedStringResource(stringLiteral: snoozeLabel),
+                textColor: snoozeColor,
+                systemImageName: "stop.circle"
+            )
+
+            // AlarmKit always renders a secondary button, so it can't be removed.
+    // Wire it to the same dismiss intent as Stop: `.custom` runs our intent
+    // instead of AlarmKit's native countdown, so whichever button the user taps
+    // the alarm reschedules and a mapping is written.
             let alertPresentation = AlarmPresentation.Alert(
                 title: LocalizedStringResource(stringLiteral: options.title),
-                stopButton: stopButton
+                stopButton: stopButton,
+                secondaryButton: snoozeButton,
+                secondaryButtonBehavior: .custom
             )
             
             let presentation = AlarmPresentation(alert: alertPresentation)
@@ -569,16 +591,10 @@ public class ExpoAlarmKitModule: Module {
                 ? AlarmDismissIntentWithLaunch(alarmId: options.id, payload: options.dismissPayload, appGroupIdentifier: appGroupId)
                 : AlarmDismissIntent(alarmId: options.id, payload: options.dismissPayload, appGroupIdentifier: appGroupId)
 
-            let secondaryIntent: (any LiveActivityIntent)?
-            if doSnoozeIntent {
-                if launchAppOnSnooze {
-                    secondaryIntent = AlarmSnoozeIntentWithLaunch(alarmId: options.id, payload: options.snoozePayload)
-                } else {
-                    secondaryIntent = AlarmSnoozeIntent(alarmId: options.id, payload: options.snoozePayload)
-                }
-            } else {
-                secondaryIntent = nil
-            }
+            // Same intent as Stop — snooze must not be a way out of the challenge.
+            let secondaryIntent: (any LiveActivityIntent)? = launchAppOnDismiss
+                ? AlarmDismissIntentWithLaunch(alarmId: options.id, payload: options.dismissPayload, appGroupIdentifier: appGroupId)
+                : AlarmDismissIntent(alarmId: options.id, payload: options.dismissPayload, appGroupIdentifier: appGroupId)
 
             // Create configuration
             let config = AlarmManager.AlarmConfiguration<Meta>(
@@ -630,8 +646,6 @@ public class ExpoAlarmKitModule: Module {
                 return false
             }
             let launchAppOnDismiss = options.launchAppOnDismiss ?? false
-            let doSnoozeIntent = options.doSnoozeIntent ?? false
-            let launchAppOnSnooze = options.launchAppOnSnooze ?? false
             
             // Convert weekday ints to Locale.Weekday
             // JS passes 1=Sunday, 2=Monday, etc. (matching iOS Calendar weekday)
@@ -663,9 +677,23 @@ public class ExpoAlarmKitModule: Module {
             )
             
             // No snooze button — see the note in rescheduleAlarmInBackground.
+            let snoozeLabel = options.snoozeButtonLabel ?? "Snooze"
+            let snoozeColor = options.snoozeButtonColor != nil ? colorFromHex(options.snoozeButtonColor!) : Color.white
+            let snoozeButton = AlarmButton(
+                text: LocalizedStringResource(stringLiteral: snoozeLabel),
+                textColor: snoozeColor,
+                systemImageName: "stop.circle"
+            )
+
+            // AlarmKit always renders a secondary button, so it can't be removed.
+    // Wire it to the same dismiss intent as Stop: `.custom` runs our intent
+    // instead of AlarmKit's native countdown, so whichever button the user taps
+    // the alarm reschedules and a mapping is written.
             let alertPresentation = AlarmPresentation.Alert(
                 title: LocalizedStringResource(stringLiteral: options.title),
-                stopButton: stopButton
+                stopButton: stopButton,
+                secondaryButton: snoozeButton,
+                secondaryButtonBehavior: .custom
             )
             
             let presentation = AlarmPresentation(alert: alertPresentation)
@@ -697,16 +725,10 @@ public class ExpoAlarmKitModule: Module {
                 ? AlarmDismissIntentWithLaunch(alarmId: options.id, payload: options.dismissPayload, appGroupIdentifier: appGroupId)
                 : AlarmDismissIntent(alarmId: options.id, payload: options.dismissPayload, appGroupIdentifier: appGroupId)
 
-            let secondaryIntent: (any LiveActivityIntent)?
-            if doSnoozeIntent {
-                if launchAppOnSnooze {
-                    secondaryIntent = AlarmSnoozeIntentWithLaunch(alarmId: options.id, payload: options.snoozePayload)
-                } else {
-                    secondaryIntent = AlarmSnoozeIntent(alarmId: options.id, payload: options.snoozePayload)
-                }
-            } else {
-                secondaryIntent = nil
-            }
+            // Same intent as Stop — snooze must not be a way out of the challenge.
+            let secondaryIntent: (any LiveActivityIntent)? = launchAppOnDismiss
+                ? AlarmDismissIntentWithLaunch(alarmId: options.id, payload: options.dismissPayload, appGroupIdentifier: appGroupId)
+                : AlarmDismissIntent(alarmId: options.id, payload: options.dismissPayload, appGroupIdentifier: appGroupId)
 
             // Create configuration with relative schedule
             let config = AlarmManager.AlarmConfiguration<Meta>(
