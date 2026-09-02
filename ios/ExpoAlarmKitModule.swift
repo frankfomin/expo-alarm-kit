@@ -42,6 +42,21 @@ public class ExpoAlarmKitStorage {
         }
         return alarmIds
     }
+
+    /// Same keys as `getAllAlarmIds`, but keeps the stored fire time instead of
+    /// discarding it. `fireEpoch` is the scheduled fire time in Unix seconds;
+    /// -2 marks a timer, and -1 a repeating alarm scheduled before this stored
+    /// a real date (older installs).
+    public static func getAllAlarmEntries() -> [(id: String, fireEpoch: Double)] {
+        guard let defaults = sharedDefaults?.dictionaryRepresentation() else { return [] }
+        var entries: [(String, Double)] = []
+        for (key, value) in defaults {
+            if key.hasPrefix(alarmKeyPrefix), let epoch = value as? Double {
+                entries.append((String(key.dropFirst(alarmKeyPrefix.count)), epoch))
+            }
+        }
+        return entries
+    }
     
     public static func clearAllAlarms() {
         guard let defaults = sharedDefaults?.dictionaryRepresentation() else { return }
@@ -248,6 +263,28 @@ public struct PersistentAlarmConfig: Codable {
     let snoozePayload: String?
     let dismissPayload: String?
     let launchAppOnDismiss: Bool
+}
+
+/// Next occurrence of a weekly recurrence, so repeating alarms can store a real
+/// fire time instead of a sentinel. Weekdays are 1=Sunday...7=Saturday, matching
+/// both the JS side and Calendar's `.weekday` component.
+@available(iOS 26.0, *)
+private func nextFireDate(hour: Int, minute: Int, weekdays: [Int], from now: Date = Date()) -> Date? {
+    let calendar = Calendar.current
+    // 0...7 rather than 0...6: today may already be past the time, so the same
+    // weekday one week out is a legitimate answer.
+    for dayOffset in 0...7 {
+        guard let day = calendar.date(byAdding: .day, value: dayOffset, to: now) else { continue }
+        let weekday = calendar.component(.weekday, from: day)
+        guard weekdays.isEmpty || weekdays.contains(weekday) else { continue }
+        var comps = calendar.dateComponents([.year, .month, .day], from: day)
+        comps.hour = hour
+        comps.minute = minute
+        comps.second = 0
+        guard let fire = calendar.date(from: comps) else { continue }
+        if fire > now { return fire }
+    }
+    return nil
 }
 
 // Schedules a new alarm from within an AppIntent perform() — runs without opening the app.
@@ -742,7 +779,11 @@ public class ExpoAlarmKitModule: Module {
             
             do {
                 try await AlarmManager.shared.schedule(id: uuid, configuration: config)
-                ExpoAlarmKitStorage.setAlarm(id: options.id, value: -1)
+                // Real fire time, not a sentinel — this is what lets JS tell
+                // that an alarm has already gone off without recomputing the
+                // recurrence itself.
+                let next = nextFireDate(hour: options.hour, minute: options.minute, weekdays: options.weekdays)
+                ExpoAlarmKitStorage.setAlarm(id: options.id, value: next?.timeIntervalSince1970 ?? -1)
                 if let delay = options.rescheduleDelaySeconds {
                     let rescheduleConfig = PersistentAlarmConfig(
                         originalAlarmId: options.id,
@@ -874,6 +915,39 @@ public class ExpoAlarmKitModule: Module {
         // MARK: - Get All Alarms
         Function("getAllAlarms") { () -> [String] in
             return ExpoAlarmKitStorage.getAllAlarmIds()
+        }
+
+        // MARK: - Alarm Fire Times (id + scheduled fire time, from App Group)
+        Function("getAlarmFireTimes") { () -> [[String: Any]] in
+            return ExpoAlarmKitStorage.getAllAlarmEntries().map {
+                ["id": $0.id, "fireEpoch": $0.fireEpoch]
+            }
+        }
+
+        // MARK: - Alarm States (live, straight from AlarmKit)
+        //
+        // Unlike getAlarmFireTimes (an App Group cache we write ourselves) this
+        // asks AlarmKit what it currently holds. `state` == "alerting" means the
+        // alarm is ringing RIGHT NOW — the one signal that needs no inference.
+        //
+        // NOTE: this is the only place the module reads AlarmManager's alarm
+        // list. If AlarmKit's API differs from what's assumed here, this is the
+        // single function to adjust; everything else keeps working.
+        AsyncFunction("getAlarmStates") { () async throws -> [[String: Any]] in
+            guard #available(iOS 26.0, *) else { return [] }
+            var result: [[String: Any]] = []
+            for alarm in try await AlarmManager.shared.alarms {
+                var entry: [String: Any] = ["id": alarm.id.uuidString]
+                switch alarm.state {
+                case .scheduled: entry["state"] = "scheduled"
+                case .countdown: entry["state"] = "countdown"
+                case .paused: entry["state"] = "paused"
+                case .alerting: entry["state"] = "alerting"
+                @unknown default: entry["state"] = "unknown"
+                }
+                result.append(entry)
+            }
+            return result
         }
 
         

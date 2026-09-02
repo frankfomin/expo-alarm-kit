@@ -223,6 +223,30 @@ export function getAllAlarms(): string[] {
   return ExpoAlarmKitModule.getAllAlarms();
 }
 
+/**
+ * Every stored alarm paired with its scheduled fire time.
+ *
+ * `fireEpoch` is a Unix timestamp in seconds. A value in the past means the
+ * alarm has already gone off — useful when the user never touched it, since no
+ * dismiss intent runs in that case and no reschedule mapping is written.
+ *
+ * Sentinels: -2 is a timer, -1 a repeating alarm scheduled by a build that
+ * predates real fire times being stored.
+ */
+export function getAlarmFireTimes(): AlarmFireTime[] {
+  return ExpoAlarmKitModule.getAlarmFireTimes();
+}
+
+/**
+ * Live alarm states, read from AlarmKit rather than our own App Group cache.
+ *
+ * `"alerting"` means the alarm is ringing right now — the only signal that
+ * requires no inference about schedules or elapsed time.
+ */
+export async function getAlarmStates(): Promise<AlarmStateEntry[]> {
+  return ExpoAlarmKitModule.getAlarmStates();
+}
+
 export function clearAllAlarms(): void {
   ExpoAlarmKitModule.clearAllAlarms();
 }
@@ -244,6 +268,24 @@ export function removeAlarm(id: string): void {
  */
 export function getLaunchPayload(): LaunchPayload | null {
   return ExpoAlarmKitModule.getLaunchPayload();
+}
+
+export type AlarmState =
+  | 'scheduled'
+  | 'countdown'
+  | 'paused'
+  | 'alerting'
+  | 'unknown';
+
+export interface AlarmFireTime {
+  id: string;
+  /** Unix timestamp in seconds; -1 and -2 are sentinels (see getAlarmFireTimes). */
+  fireEpoch: number;
+}
+
+export interface AlarmStateEntry {
+  id: string;
+  state: AlarmState;
 }
 
 export interface RescheduledAlarm {
@@ -292,6 +334,8 @@ const ExpoAlarmKit = {
   clearAllAlarms,
   removeAlarm,
   getLaunchPayload,
+  getAlarmFireTimes,
+  getAlarmStates,
   getPendingRescheduledAlarms,
   clearPendingRescheduledAlarms,
 };

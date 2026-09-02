@@ -117,6 +117,20 @@ interface ExpoAlarmKitModuleType {
   getAllAlarms(): string[];
 
   /**
+   * Every stored alarm with its scheduled fire time (Unix seconds).
+   * -2 marks a timer; -1 a repeating alarm stored before real dates were kept.
+   */
+  getAlarmFireTimes(): { id: string; fireEpoch: number }[];
+
+  /** Live alarm states straight from AlarmKit. */
+  getAlarmStates(): Promise<
+    {
+      id: string;
+      state: 'scheduled' | 'countdown' | 'paused' | 'alerting' | 'unknown';
+    }[]
+  >;
+
+  /**
    * Remove an alarm from UserDefaults (does not cancel the native alarm).
    * @param id - The alarm ID to remove.
    */
