@@ -267,19 +267,12 @@ private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async {
         systemImageName: "stop.circle"
     )
 
-    let snoozeLabel = config.snoozeButtonLabel ?? "Snooze"
-    let snoozeColor = config.snoozeButtonColor != nil ? colorFromHex(config.snoozeButtonColor!) : Color.white
-    let snoozeButton = AlarmButton(
-        text: LocalizedStringResource(stringLiteral: snoozeLabel),
-        textColor: snoozeColor,
-        systemImageName: "clock.badge.checkmark"
-    )
-
+    // No snooze button. `.countdown` snoozes natively without running any
+    // intent, so the app never learns the alarm fired — no mapping, no
+    // challenge. Stop is the only exit, and Stop always runs AlarmDismissIntent.
     let alertPresentation = AlarmPresentation.Alert(
         title: LocalizedStringResource(stringLiteral: config.title),
-        stopButton: stopButton,
-        secondaryButton: snoozeButton,
-        secondaryButtonBehavior: .countdown
+        stopButton: stopButton
     )
     let presentation = AlarmPresentation(alert: alertPresentation)
 
@@ -541,21 +534,10 @@ public class ExpoAlarmKitModule: Module {
                 systemImageName: "stop.circle"
             )
             
-            // Create snooze button
-            let snoozeLabel = options.snoozeButtonLabel ?? "Snooze"
-            let snoozeColor = options.snoozeButtonColor != nil ? colorFromHex(options.snoozeButtonColor!) : Color.white
-            let snoozeButton = AlarmButton(
-                text: LocalizedStringResource(stringLiteral: snoozeLabel),
-                textColor: snoozeColor,
-                systemImageName: "clock.badge.checkmark"
-            )
-            
-            // Create alert presentation with intent if needed
+            // No snooze button — see the note in rescheduleAlarmInBackground.
             let alertPresentation = AlarmPresentation.Alert(
                 title: LocalizedStringResource(stringLiteral: options.title),
-                stopButton: stopButton,
-                secondaryButton: snoozeButton,
-                secondaryButtonBehavior: .countdown
+                stopButton: stopButton
             )
             
             let presentation = AlarmPresentation(alert: alertPresentation)
@@ -680,21 +662,10 @@ public class ExpoAlarmKitModule: Module {
                 systemImageName: "stop.circle"
             )
             
-            // Create snooze button
-            let snoozeLabel = options.snoozeButtonLabel ?? "Snooze"
-            let snoozeColor = options.snoozeButtonColor != nil ? colorFromHex(options.snoozeButtonColor!) : Color.white
-            let snoozeButton = AlarmButton(
-                text: LocalizedStringResource(stringLiteral: snoozeLabel),
-                textColor: snoozeColor,
-                systemImageName: "clock.badge.checkmark"
-            )
-            
-            // Create alert presentation
+            // No snooze button — see the note in rescheduleAlarmInBackground.
             let alertPresentation = AlarmPresentation.Alert(
                 title: LocalizedStringResource(stringLiteral: options.title),
-                stopButton: stopButton,
-                secondaryButton: snoozeButton,
-                secondaryButtonBehavior: .countdown
+                stopButton: stopButton
             )
             
             let presentation = AlarmPresentation(alert: alertPresentation)
