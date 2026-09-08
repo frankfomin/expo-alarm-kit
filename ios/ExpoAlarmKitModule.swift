@@ -9,6 +9,8 @@ private let alarmKeyPrefix = "ExpoAlarmKit.alarm:"
 private let launchAppKeyPrefix = "ExpoAlarmKit.launchApp:"
 private let rescheduleConfigKeyPrefix = "ExpoAlarmKit.rescheduleConfig:"
 private let rescheduledKeyPrefix = "ExpoAlarmKit.rescheduled:"
+// alarmId -> id of the backstop alarm armed alongside it. See armBackstopAlarm.
+private let backstopKeyPrefix = "ExpoAlarmKit.backstop:"
 
 // MARK: - App Group Storage Manager
 @available(iOS 26.0, *)
@@ -108,6 +110,33 @@ public class ExpoAlarmKitStorage {
         }
     }
 
+    // MARK: - Backstop Mappings (alarmId -> the backstop armed for it)
+    public static func setBackstop(alarmId: String, backstopId: String) {
+        sharedDefaults?.set(backstopId, forKey: backstopKeyPrefix + alarmId)
+    }
+
+    public static func getBackstopId(alarmId: String) -> String? {
+        return sharedDefaults?.string(forKey: backstopKeyPrefix + alarmId)
+    }
+
+    public static func removeBackstop(alarmId: String) {
+        sharedDefaults?.removeObject(forKey: backstopKeyPrefix + alarmId)
+    }
+
+    /// Every armed backstop id. JS needs these to keep its orphan sweep from
+    /// cancelling the safety net — backstops deliberately live outside the
+    /// app's alarms table.
+    public static func getAllBackstopIds() -> [String] {
+        guard let defaults = sharedDefaults?.dictionaryRepresentation() else { return [] }
+        var ids: [String] = []
+        for (key, value) in defaults {
+            if key.hasPrefix(backstopKeyPrefix), let id = value as? String {
+                ids.append(id)
+            }
+        }
+        return ids
+    }
+
     public static func setLaunchAppOnDismiss(alarmId: String, value: Bool) {
         sharedDefaults?.set(value, forKey: launchAppKeyPrefix + alarmId)
     }
@@ -142,6 +171,10 @@ struct ScheduleAlarmOptions: Record {
     /// When set, dismissing the alarm without opening the app will automatically
     /// reschedule it this many seconds later. No app launch required.
     @Field var rescheduleDelaySeconds: Double?
+    /// When set, a one-time backstop alarm is armed this many seconds after
+    /// this alarm's own fire time, at schedule time rather than at dismiss
+    /// time. It fires unless a successful dismiss cancels it.
+    @Field var backstopDelaySeconds: Double?
 }
 
 @available(iOS 26.0, *)
@@ -163,6 +196,9 @@ struct ScheduleRepeatingAlarmOptions: Record {
     @Field var snoozeButtonColor: String?
     @Field var tintColor: String?
     @Field var snoozeDuration: Int?
+    /// When set, a one-time backstop alarm is armed this many seconds after
+    /// this alarm's next fire time. See ScheduleAlarmOptions.backstopDelaySeconds.
+    @Field var backstopDelaySeconds: Double?
     /// When set, dismissing without opening the app reschedules a one-time alarm
     /// this many seconds later. Repeats until the user opens the app and cancels.
     @Field var rescheduleDelaySeconds: Double?
@@ -234,13 +270,24 @@ public struct AlarmDismissIntent: LiveActivityIntent {
         // Bootstrap storage so this background process can read/write App Group defaults
         ExpoAlarmKitStorage.appGroupIdentifier = self.appGroupIdentifier
 
+        // No reschedule config means this alarm was never part of a chain, so
+        // there is nothing to keep alive and teardown is unconditional.
+        var successorArmed = true
         if let config = ExpoAlarmKitStorage.getRescheduleConfig(alarmId: self.alarmId) {
-            await rescheduleAlarmInBackground(config: config)
+            successorArmed = await rescheduleAlarmInBackground(config: config)
         }
 
-        ExpoAlarmKitStorage.removeAlarm(id: self.alarmId)
-        ExpoAlarmKitStorage.removeLaunchAppOnDismiss(alarmId: self.alarmId)
-        ExpoAlarmKitStorage.removeRescheduleConfig(alarmId: self.alarmId)
+        // Tearing this down is only safe once a successor is actually armed.
+        // Deleting the config after a failed reschedule leaves nothing to
+        // recover from: no alarm, no mapping, no config — the chain is gone for
+        // good and the user sleeps through. Keep it, leave the backstop armed,
+        // and let that carry the chain instead.
+        if successorArmed {
+            cancelBackstopChain(for: self.alarmId)
+            ExpoAlarmKitStorage.removeAlarm(id: self.alarmId)
+            ExpoAlarmKitStorage.removeLaunchAppOnDismiss(alarmId: self.alarmId)
+            ExpoAlarmKitStorage.removeRescheduleConfig(alarmId: self.alarmId)
+        }
 
         return .result()
     }
@@ -252,6 +299,9 @@ public struct PersistentAlarmConfig: Codable {
     let title: String
     let soundName: String?
     let rescheduleDelaySeconds: Double
+    /// nil disables the backstop. Optional so configs written by older builds
+    /// still decode.
+    let backstopDelaySeconds: Double?
     let stopButtonLabel: String?
     let stopButtonColor: String?
     let snoozeButtonLabel: String?
@@ -287,15 +337,25 @@ private func nextFireDate(hour: Int, minute: Int, weekdays: [Int], from now: Dat
     return nil
 }
 
-// Schedules a new alarm from within an AppIntent perform() — runs without opening the app.
+/// Every alarm in a reschedule chain — successors and backstops alike — is
+/// presented identically, so it is built in one place.
+///
+/// No snooze button. `.countdown` snoozes natively without running any intent,
+/// so the app never learns the alarm fired — no mapping, no challenge. Stop is
+/// the only exit, and Stop always runs AlarmDismissIntent. AlarmKit always
+/// renders a secondary button and it can't be removed, so it is wired to the
+/// same dismiss intent as Stop: `.custom` runs our intent instead of AlarmKit's
+/// native countdown, so whichever button the user taps the alarm reschedules
+/// and a mapping is written.
 @available(iOS 26.0, *)
-private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async {
-    struct Meta: AlarmMetadata {}
+struct ChainAlarmMeta: AlarmMetadata {}
 
-    let newAlarmId = UUID()
-    let newAlarmIdString = newAlarmId.uuidString
-    let fireDate = Date().addingTimeInterval(config.rescheduleDelaySeconds)
-
+@available(iOS 26.0, *)
+private func buildChainAlarmConfiguration(
+    config: PersistentAlarmConfig,
+    alarmId: String,
+    fireDate: Date
+) -> AlarmManager.AlarmConfiguration<ChainAlarmMeta> {
     let stopLabel = config.stopButtonLabel ?? "Stop"
     let stopColor = config.stopButtonColor != nil ? colorFromHex(config.stopButtonColor!) : Color.white
     let stopButton = AlarmButton(
@@ -304,9 +364,6 @@ private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async {
         systemImageName: "stop.circle"
     )
 
-    // No snooze button. `.countdown` snoozes natively without running any
-    // intent, so the app never learns the alarm fired — no mapping, no
-    // challenge. Stop is the only exit, and Stop always runs AlarmDismissIntent.
     let snoozeLabel = config.snoozeButtonLabel ?? "Snooze"
     let snoozeColor = config.snoozeButtonColor != nil ? colorFromHex(config.snoozeButtonColor!) : Color.white
     let snoozeButton = AlarmButton(
@@ -315,17 +372,12 @@ private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async {
         systemImageName: "stop.circle"
     )
 
-    // AlarmKit always renders a secondary button, so it can't be removed.
-    // Wire it to the same dismiss intent as Stop: `.custom` runs our intent
-    // instead of AlarmKit's native countdown, so whichever button the user taps
-    // the alarm reschedules and a mapping is written.
     let alertPresentation = AlarmPresentation.Alert(
         title: LocalizedStringResource(stringLiteral: config.title),
         stopButton: stopButton,
         secondaryButton: snoozeButton,
         secondaryButtonBehavior: .custom
     )
-    let presentation = AlarmPresentation(alert: alertPresentation)
 
     let countdownDuration = Alarm.CountdownDuration(
         preAlert: nil,
@@ -333,9 +385,9 @@ private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async {
     )
 
     let alarmTintColor = config.tintColor != nil ? colorFromHex(config.tintColor!) : Color.blue
-    let attributes = AlarmAttributes<Meta>(
-        presentation: presentation,
-        metadata: Meta(),
+    let attributes = AlarmAttributes<ChainAlarmMeta>(
+        presentation: AlarmPresentation(alert: alertPresentation),
+        metadata: ChainAlarmMeta(),
         tintColor: alarmTintColor
     )
 
@@ -348,15 +400,15 @@ private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async {
 
     let appGroupId = ExpoAlarmKitStorage.appGroupIdentifier ?? ""
     let stopIntent: any LiveActivityIntent = config.launchAppOnDismiss
-        ? AlarmDismissIntentWithLaunch(alarmId: newAlarmIdString, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
-        : AlarmDismissIntent(alarmId: newAlarmIdString, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
+        ? AlarmDismissIntentWithLaunch(alarmId: alarmId, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
+        : AlarmDismissIntent(alarmId: alarmId, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
 
     // Same intent as Stop — snooze must not be a way out of the challenge.
     let secondaryIntent: (any LiveActivityIntent)? = config.launchAppOnDismiss
-        ? AlarmDismissIntentWithLaunch(alarmId: newAlarmIdString, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
-        : AlarmDismissIntent(alarmId: newAlarmIdString, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
+        ? AlarmDismissIntentWithLaunch(alarmId: alarmId, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
+        : AlarmDismissIntent(alarmId: alarmId, payload: config.dismissPayload, appGroupIdentifier: appGroupId)
 
-    let alarmConfig = AlarmManager.AlarmConfiguration<Meta>(
+    return AlarmManager.AlarmConfiguration<ChainAlarmMeta>(
         countdownDuration: countdownDuration,
         schedule: .fixed(fireDate),
         attributes: attributes,
@@ -364,37 +416,146 @@ private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async {
         secondaryIntent: secondaryIntent,
         sound: alarmSound
     )
+}
+
+/// Copy of `config` re-pointed at the chain root, for the next hop.
+@available(iOS 26.0, *)
+private func successorConfig(from config: PersistentAlarmConfig) -> PersistentAlarmConfig {
+    return PersistentAlarmConfig(
+        // Carry the ROOT id, not this hop's id. This field identifies the alarm
+        // the user actually created; overwriting it each hop turns the pending
+        // mappings into a chain JS has to walk in order.
+        originalAlarmId: config.originalAlarmId,
+        title: config.title,
+        soundName: config.soundName,
+        rescheduleDelaySeconds: config.rescheduleDelaySeconds,
+        backstopDelaySeconds: config.backstopDelaySeconds,
+        stopButtonLabel: config.stopButtonLabel,
+        stopButtonColor: config.stopButtonColor,
+        snoozeButtonLabel: config.snoozeButtonLabel,
+        snoozeButtonColor: config.snoozeButtonColor,
+        tintColor: config.tintColor,
+        snoozeDuration: config.snoozeDuration,
+        doSnoozeIntent: config.doSnoozeIntent,
+        launchAppOnSnooze: config.launchAppOnSnooze,
+        snoozePayload: config.snoozePayload,
+        dismissPayload: config.dismissPayload,
+        launchAppOnDismiss: config.launchAppOnDismiss
+    )
+}
+
+/// Cancels one backstop alarm and forgets everything stored about it.
+@available(iOS 26.0, *)
+private func cancelBackstopAlarm(_ backstopId: String) {
+    if let uuid = UUID(uuidString: backstopId) {
+        try? AlarmManager.shared.cancel(id: uuid)
+    }
+    ExpoAlarmKitStorage.removeAlarm(id: backstopId)
+    ExpoAlarmKitStorage.removeRescheduleConfig(alarmId: backstopId)
+    ExpoAlarmKitStorage.removeLaunchAppOnDismiss(alarmId: backstopId)
+}
+
+/// Cancels the backstop armed for `alarmId`, and any backstop armed for that
+/// backstop in turn. A backstop is a full chain member, so it can have grown a
+/// net of its own before this runs.
+@available(iOS 26.0, *)
+private func cancelBackstopChain(for alarmId: String) {
+    var current = alarmId
+    var seen: Set<String> = [alarmId]
+    while let backstopId = ExpoAlarmKitStorage.getBackstopId(alarmId: current) {
+        ExpoAlarmKitStorage.removeBackstop(alarmId: current)
+        if seen.contains(backstopId) { break }
+        seen.insert(backstopId)
+        cancelBackstopAlarm(backstopId)
+        current = backstopId
+    }
+}
+
+/// Arms the safety net for `alarmId`: a one-time alarm `backstopDelaySeconds`
+/// past that alarm's own fire time, which goes off unless a successful dismiss
+/// cancels it first.
+///
+/// The point is *when* this is armed. The dismiss-time reschedule runs from a
+/// background App Intent that AlarmKit can refuse — most reliably when the
+/// device is sitting on the lock screen with the passcode prompt up — and when
+/// it is refused there is nothing left to wake the user. This one is armed
+/// earlier, from a context that could already schedule, so it survives that
+/// window. It is itself a full chain member: dismissing it reschedules and
+/// arms the next backstop, so the net never runs out.
+@available(iOS 26.0, *)
+private func armBackstopAlarm(for alarmId: String, config: PersistentAlarmConfig, baseFireDate: Date) async {
+    guard let delay = config.backstopDelaySeconds, delay > 0 else { return }
+
+    // Replace whatever is already armed for this alarm rather than stacking.
+    cancelBackstopChain(for: alarmId)
+
+    let backstopId = UUID()
+    let backstopIdString = backstopId.uuidString
+    let candidate = baseFireDate.addingTimeInterval(delay)
+    let fireDate = candidate > Date() ? candidate : Date().addingTimeInterval(delay)
+    let backstopConfig = successorConfig(from: config)
 
     do {
-        try await AlarmManager.shared.schedule(id: newAlarmId, configuration: alarmConfig)
+        try await AlarmManager.shared.schedule(
+            id: backstopId,
+            configuration: buildChainAlarmConfiguration(
+                config: backstopConfig,
+                alarmId: backstopIdString,
+                fireDate: fireDate
+            )
+        )
+        ExpoAlarmKitStorage.setAlarm(id: backstopIdString, value: fireDate.timeIntervalSince1970)
+        ExpoAlarmKitStorage.setRescheduleConfig(alarmId: backstopIdString, config: backstopConfig)
+        ExpoAlarmKitStorage.setBackstop(alarmId: alarmId, backstopId: backstopIdString)
+    } catch {
+        print("[ExpoAlarmKit] Failed to arm backstop for \(alarmId): \(error)")
+    }
+}
+
+/// Schedules the next alarm in the chain from within an AppIntent perform() —
+/// runs without opening the app.
+///
+/// Returns whether a successor is actually armed. The caller MUST NOT tear down
+/// the dismissed alarm's stored state on a false: that state, plus the backstop
+/// armed earlier, is the only way the chain recovers.
+@available(iOS 26.0, *)
+private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async -> Bool {
+    // A refusal here is sometimes transient, so it is worth a couple of quick
+    // retries before falling back on the backstop.
+    let backoffNanoseconds: [UInt64] = [0, 400_000_000, 1_200_000_000]
+
+    for backoff in backoffNanoseconds {
+        if backoff > 0 { try? await Task.sleep(nanoseconds: backoff) }
+
+        let newAlarmId = UUID()
+        let newAlarmIdString = newAlarmId.uuidString
+        let fireDate = Date().addingTimeInterval(config.rescheduleDelaySeconds)
+        let nextConfig = successorConfig(from: config)
+
+        do {
+            try await AlarmManager.shared.schedule(
+                id: newAlarmId,
+                configuration: buildChainAlarmConfiguration(
+                    config: nextConfig,
+                    alarmId: newAlarmIdString,
+                    fireDate: fireDate
+                )
+            )
+        } catch {
+            print("[ExpoAlarmKit] Background reschedule failed: \(error)")
+            continue
+        }
+
         ExpoAlarmKitStorage.setAlarm(id: newAlarmIdString, value: fireDate.timeIntervalSince1970)
         // Carry the reschedule config forward so the next dismiss also reschedules
-        let nextConfig = PersistentAlarmConfig(
-            // Carry the ROOT id, not this hop's id. This field identifies the
-            // alarm the user actually created; overwriting it each hop turns
-            // the mappings below into a chain JS has to walk in order.
-            originalAlarmId: config.originalAlarmId,
-            title: config.title,
-            soundName: config.soundName,
-            rescheduleDelaySeconds: config.rescheduleDelaySeconds,
-            stopButtonLabel: config.stopButtonLabel,
-            stopButtonColor: config.stopButtonColor,
-            snoozeButtonLabel: config.snoozeButtonLabel,
-            snoozeButtonColor: config.snoozeButtonColor,
-            tintColor: config.tintColor,
-            snoozeDuration: config.snoozeDuration,
-            doSnoozeIntent: config.doSnoozeIntent,
-            launchAppOnSnooze: config.launchAppOnSnooze,
-            snoozePayload: config.snoozePayload,
-            dismissPayload: config.dismissPayload,
-            launchAppOnDismiss: config.launchAppOnDismiss
-        )
         ExpoAlarmKitStorage.setRescheduleConfig(alarmId: newAlarmIdString, config: nextConfig)
         // Record mapping so JS can reconcile alarm IDs when it next opens
         ExpoAlarmKitStorage.setRescheduled(originalAlarmId: config.originalAlarmId, newAlarmId: newAlarmIdString)
-    } catch {
-        print("[ExpoAlarmKit] Background reschedule failed: \(error)")
+        await armBackstopAlarm(for: newAlarmIdString, config: nextConfig, baseFireDate: fireDate)
+        return true
     }
+
+    return false
 }
 
 // MARK: - App Intent for Alarm Dismissal (With App Launch)
@@ -425,13 +586,24 @@ public struct AlarmDismissIntentWithLaunch: LiveActivityIntent {
         ExpoAlarmKitStorage.appGroupIdentifier = self.appGroupIdentifier
         ExpoAlarmKitModule.launchPayload = buildLaunchPayload(alarmId: self.alarmId, payload: self.payload)
 
+        // No reschedule config means this alarm was never part of a chain, so
+        // there is nothing to keep alive and teardown is unconditional.
+        var successorArmed = true
         if let config = ExpoAlarmKitStorage.getRescheduleConfig(alarmId: self.alarmId) {
-            await rescheduleAlarmInBackground(config: config)
+            successorArmed = await rescheduleAlarmInBackground(config: config)
         }
 
-        ExpoAlarmKitStorage.removeAlarm(id: self.alarmId)
-        ExpoAlarmKitStorage.removeLaunchAppOnDismiss(alarmId: self.alarmId)
-        ExpoAlarmKitStorage.removeRescheduleConfig(alarmId: self.alarmId)
+        // Tearing this down is only safe once a successor is actually armed.
+        // Deleting the config after a failed reschedule leaves nothing to
+        // recover from: no alarm, no mapping, no config — the chain is gone for
+        // good and the user sleeps through. Keep it, leave the backstop armed,
+        // and let that carry the chain instead.
+        if successorArmed {
+            cancelBackstopChain(for: self.alarmId)
+            ExpoAlarmKitStorage.removeAlarm(id: self.alarmId)
+            ExpoAlarmKitStorage.removeLaunchAppOnDismiss(alarmId: self.alarmId)
+            ExpoAlarmKitStorage.removeRescheduleConfig(alarmId: self.alarmId)
+        }
 
         return .result()
     }
@@ -653,6 +825,7 @@ public class ExpoAlarmKitModule: Module {
                         title: options.title,
                         soundName: options.soundName,
                         rescheduleDelaySeconds: delay,
+                        backstopDelaySeconds: options.backstopDelaySeconds,
                         stopButtonLabel: options.stopButtonLabel,
                         stopButtonColor: options.stopButtonColor,
                         snoozeButtonLabel: options.snoozeButtonLabel,
@@ -666,6 +839,9 @@ public class ExpoAlarmKitModule: Module {
                         launchAppOnDismiss: options.launchAppOnDismiss ?? false
                     )
                     ExpoAlarmKitStorage.setRescheduleConfig(alarmId: options.id, config: rescheduleConfig)
+                    // Armed here, while scheduling demonstrably works, rather
+                    // than at dismiss time when it may not.
+                    await armBackstopAlarm(for: options.id, config: rescheduleConfig, baseFireDate: date)
                 }
                 return true
             } catch {
@@ -790,6 +966,7 @@ public class ExpoAlarmKitModule: Module {
                         title: options.title,
                         soundName: options.soundName,
                         rescheduleDelaySeconds: delay,
+                        backstopDelaySeconds: options.backstopDelaySeconds,
                         stopButtonLabel: options.stopButtonLabel,
                         stopButtonColor: options.stopButtonColor,
                         snoozeButtonLabel: options.snoozeButtonLabel,
@@ -803,6 +980,12 @@ public class ExpoAlarmKitModule: Module {
                         launchAppOnDismiss: options.launchAppOnDismiss ?? false
                     )
                     ExpoAlarmKitStorage.setRescheduleConfig(alarmId: options.id, config: rescheduleConfig)
+                    // A one-time backstop covering the next occurrence only.
+                    // Later occurrences get theirs when JS re-arms the repeating
+                    // alarm after the challenge is completed.
+                    if let next {
+                        await armBackstopAlarm(for: options.id, config: rescheduleConfig, baseFireDate: next)
+                    }
                 }
                 return true
             } catch {
@@ -902,6 +1085,9 @@ public class ExpoAlarmKitModule: Module {
             
             do {
                 try AlarmManager.shared.cancel(id: uuid)
+                // Otherwise the safety net outlives the alarm it was protecting
+                // and rings after the user has already woken up.
+                cancelBackstopChain(for: id)
                 ExpoAlarmKitStorage.removeAlarm(id: id)
                 ExpoAlarmKitStorage.removeLaunchAppOnDismiss(alarmId: id)
                 ExpoAlarmKitStorage.removeRescheduleConfig(alarmId: id)
@@ -956,6 +1142,7 @@ public class ExpoAlarmKitModule: Module {
             ExpoAlarmKitStorage.removeAlarm(id: id)
             ExpoAlarmKitStorage.removeLaunchAppOnDismiss(alarmId: id)
             ExpoAlarmKitStorage.removeRescheduleConfig(alarmId: id)
+            ExpoAlarmKitStorage.removeBackstop(alarmId: id)
         }
         
         // MARK: - Clear All Alarms (from App Group storage only)
@@ -970,6 +1157,13 @@ public class ExpoAlarmKitModule: Module {
             return ExpoAlarmKitStorage.getAllRescheduled().map { mapping in
                 ["originalAlarmId": mapping.originalAlarmId, "newAlarmId": mapping.newAlarmId]
             }
+        }
+
+        // MARK: - Get Backstop Alarm IDs
+        // The backstops currently armed. These never appear in the app's alarms
+        // table, so an orphan sweep must be told to spare them.
+        Function("getBackstopAlarmIds") { () -> [String] in
+            return ExpoAlarmKitStorage.getAllBackstopIds()
         }
 
         // MARK: - Clear Pending Rescheduled Alarms

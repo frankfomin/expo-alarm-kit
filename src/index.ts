@@ -86,6 +86,18 @@ export interface ScheduleAlarmOptions {
    * alarm is cancelled via cancelAlarm() or the user opens the app and stops it from JS.
    */
   rescheduleDelaySeconds?: number;
+  /**
+   * When set, a one-time backstop alarm is armed alongside this one, this many
+   * seconds after its fire time, and is cancelled only when a dismissal
+   * successfully arms the next alarm in the chain.
+   *
+   * This exists because the dismiss-time reschedule runs in a background App
+   * Intent that AlarmKit can refuse — most reliably while the device sits on
+   * the lock screen with the passcode prompt up. Without a backstop, that
+   * refusal ends the chain silently and the user sleeps through. Requires
+   * rescheduleDelaySeconds; ignored without it.
+   */
+  backstopDelaySeconds?: number;
 }
 
 /**
@@ -157,6 +169,18 @@ export interface ScheduleRepeatingAlarmOptions {
    * This is the "keep bugging them until they complete the challenge" mechanism.
    */
   rescheduleDelaySeconds?: number;
+  /**
+   * When set, a one-time backstop alarm is armed alongside this one, this many
+   * seconds after its fire time, and is cancelled only when a dismissal
+   * successfully arms the next alarm in the chain.
+   *
+   * This exists because the dismiss-time reschedule runs in a background App
+   * Intent that AlarmKit can refuse — most reliably while the device sits on
+   * the lock screen with the passcode prompt up. Without a backstop, that
+   * refusal ends the chain silently and the user sleeps through. Requires
+   * rescheduleDelaySeconds; ignored without it.
+   */
+  backstopDelaySeconds?: number;
 }
 
 /**
@@ -321,6 +345,17 @@ export function clearPendingRescheduledAlarms(): void {
   ExpoAlarmKitModule.clearPendingRescheduledAlarms();
 }
 
+/**
+ * The backstop alarms currently armed (see `backstopDelaySeconds`).
+ *
+ * These are deliberately not alarms your app scheduled by id, so anything that
+ * cancels alarms it does not recognise — an orphan sweep, a "stop everything"
+ * button — must spare these or it will tear down the safety net.
+ */
+export function getBackstopAlarmIds(): string[] {
+  return ExpoAlarmKitModule.getBackstopAlarmIds();
+}
+
 // Default export object for namespace-style usage
 const ExpoAlarmKit = {
   configure,
@@ -338,6 +373,7 @@ const ExpoAlarmKit = {
   getAlarmStates,
   getPendingRescheduledAlarms,
   clearPendingRescheduledAlarms,
+  getBackstopAlarmIds,
 };
 
 export default ExpoAlarmKit;

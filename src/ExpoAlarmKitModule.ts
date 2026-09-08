@@ -24,6 +24,7 @@ export interface ScheduleAlarmOptions {
   tintColor?: string | null;
   snoozeDuration?: number | null;
   rescheduleDelaySeconds?: number | null;
+  backstopDelaySeconds?: number | null;
 }
 
 export interface ScheduleRepeatingAlarmOptions {
@@ -45,6 +46,7 @@ export interface ScheduleRepeatingAlarmOptions {
   tintColor?: string | null;
   snoozeDuration?: number | null;
   rescheduleDelaySeconds?: number | null;
+  backstopDelaySeconds?: number | null;
 }
 
 export interface ScheduleTimerOptions {
@@ -148,6 +150,12 @@ interface ExpoAlarmKitModuleType {
    * Call clearPendingRescheduledAlarms() after consuming these.
    */
   getPendingRescheduledAlarms(): { originalAlarmId: string; newAlarmId: string }[];
+
+  /**
+   * IDs of the backstop alarms currently armed. Spare these from any sweep that
+   * cancels unrecognised alarms.
+   */
+  getBackstopAlarmIds(): string[];
 
   /**
    * Clear the pending rescheduled alarm mappings after they have been consumed.
