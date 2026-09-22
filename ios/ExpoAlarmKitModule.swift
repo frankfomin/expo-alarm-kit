@@ -9,8 +9,12 @@ private let alarmKeyPrefix = "ExpoAlarmKit.alarm:"
 private let launchAppKeyPrefix = "ExpoAlarmKit.launchApp:"
 private let rescheduleConfigKeyPrefix = "ExpoAlarmKit.rescheduleConfig:"
 private let rescheduledKeyPrefix = "ExpoAlarmKit.rescheduled:"
-// alarmId -> id of the backstop alarm armed alongside it. See armBackstopAlarm.
+// alarmId -> id of the next backstop rung armed behind it. See armBackstopAlarm.
 private let backstopKeyPrefix = "ExpoAlarmKit.backstop:"
+
+/// Ceiling on the alarms armed for a single fire event: the alarm itself plus
+/// the backstop ladder behind it.
+private let maxAlarmsPerChain = 8
 
 // MARK: - App Group Storage Manager
 @available(iOS 26.0, *)
@@ -471,17 +475,26 @@ private func cancelBackstopChain(for alarmId: String) {
     }
 }
 
-/// Arms the safety net for `alarmId`: a one-time alarm `backstopDelaySeconds`
-/// past that alarm's own fire time, which goes off unless a successful dismiss
-/// cancels it first.
+/// Arms the safety net for `alarmId`: a ladder of one-time alarms at
+/// `backstopDelaySeconds` intervals past that alarm's own fire time, each of
+/// which goes off unless a successful dismiss cancels it first.
 ///
 /// The point is *when* this is armed. The dismiss-time reschedule runs from a
 /// background App Intent that AlarmKit can refuse — most reliably when the
 /// device is sitting on the lock screen with the passcode prompt up — and when
-/// it is refused there is nothing left to wake the user. This one is armed
-/// earlier, from a context that could already schedule, so it survives that
-/// window. It is itself a full chain member: dismissing it reschedules and
+/// it is refused there is nothing left to wake the user. These are armed
+/// earlier, from a context that could already schedule, so they survive that
+/// window. Each rung is a full chain member: dismissing it reschedules and
 /// arms the next backstop, so the net never runs out.
+///
+/// The ladder is what survives a *silence* that is not a dismiss — the Ring/
+/// Silent switch, a volume button or the side button all quiet a ringing alarm
+/// without dismissing it, which leaves the dismiss-driven reschedule unfired.
+/// One rung per silence, so sleeping through costs a deliberate act each time.
+///
+/// Rungs are stored as a linked list off `alarmId`, so `cancelBackstopChain`
+/// tears down the whole ladder, and dismissing any rung takes the later ones
+/// with it.
 @available(iOS 26.0, *)
 private func armBackstopAlarm(for alarmId: String, config: PersistentAlarmConfig, baseFireDate: Date) async {
     guard let delay = config.backstopDelaySeconds, delay > 0 else { return }
@@ -489,26 +502,36 @@ private func armBackstopAlarm(for alarmId: String, config: PersistentAlarmConfig
     // Replace whatever is already armed for this alarm rather than stacking.
     cancelBackstopChain(for: alarmId)
 
-    let backstopId = UUID()
-    let backstopIdString = backstopId.uuidString
-    let candidate = baseFireDate.addingTimeInterval(delay)
-    let fireDate = candidate > Date() ? candidate : Date().addingTimeInterval(delay)
     let backstopConfig = successorConfig(from: config)
+    var previousId = alarmId
 
-    do {
-        try await AlarmManager.shared.schedule(
-            id: backstopId,
-            configuration: buildChainAlarmConfiguration(
-                config: backstopConfig,
-                alarmId: backstopIdString,
-                fireDate: fireDate
+    for rung in 1..<maxAlarmsPerChain {
+        let offset = delay * Double(rung)
+        let candidate = baseFireDate.addingTimeInterval(offset)
+        let fireDate = candidate > Date() ? candidate : Date().addingTimeInterval(offset)
+
+        let backstopId = UUID()
+        let backstopIdString = backstopId.uuidString
+
+        do {
+            try await AlarmManager.shared.schedule(
+                id: backstopId,
+                configuration: buildChainAlarmConfiguration(
+                    config: backstopConfig,
+                    alarmId: backstopIdString,
+                    fireDate: fireDate
+                )
             )
-        )
+        } catch {
+            // Keep the rungs armed so far: a short ladder beats no ladder.
+            print("[ExpoAlarmKit] Failed to arm backstop rung \(rung) for \(alarmId): \(error)")
+            return
+        }
+
         ExpoAlarmKitStorage.setAlarm(id: backstopIdString, value: fireDate.timeIntervalSince1970)
         ExpoAlarmKitStorage.setRescheduleConfig(alarmId: backstopIdString, config: backstopConfig)
-        ExpoAlarmKitStorage.setBackstop(alarmId: alarmId, backstopId: backstopIdString)
-    } catch {
-        print("[ExpoAlarmKit] Failed to arm backstop for \(alarmId): \(error)")
+        ExpoAlarmKitStorage.setBackstop(alarmId: previousId, backstopId: backstopIdString)
+        previousId = backstopIdString
     }
 }
 
