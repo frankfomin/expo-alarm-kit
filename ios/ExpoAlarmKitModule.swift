@@ -586,7 +586,11 @@ private func rescheduleAlarmInBackground(config: PersistentAlarmConfig) async ->
 public struct AlarmDismissIntentWithLaunch: LiveActivityIntent {
     public static var title: LocalizedStringResource = "Dismiss Alarm"
     public static var description = IntentDescription("Handles alarm dismissal and opens app")
-    public static var openAppWhenRun: Bool = true
+    // Starts in the background and only asks for the foreground once the chain
+    // is safe. `openAppWhenRun` launched the app before perform() ran, so on a
+    // locked device the passcode prompt came first and the reschedule was
+    // refused while it was up.
+    public static var supportedModes: IntentModes = [.background, .foreground(.dynamic)]
 
     @Parameter(title: "alarmId")
     public var alarmId: String
@@ -608,6 +612,7 @@ public struct AlarmDismissIntentWithLaunch: LiveActivityIntent {
     public func perform() async throws -> some IntentResult {
         ExpoAlarmKitStorage.appGroupIdentifier = self.appGroupIdentifier
         ExpoAlarmKitModule.launchPayload = buildLaunchPayload(alarmId: self.alarmId, payload: self.payload)
+        NSLog("[ExpoAlarmKit] launch-dismiss start alarm=%@ mode=%@", self.alarmId, String(describing: systemContext.currentMode))
 
         // No reschedule config means this alarm was never part of a chain, so
         // there is nothing to keep alive and teardown is unconditional.
@@ -626,6 +631,20 @@ public struct AlarmDismissIntentWithLaunch: LiveActivityIntent {
             ExpoAlarmKitStorage.removeAlarm(id: self.alarmId)
             ExpoAlarmKitStorage.removeLaunchAppOnDismiss(alarmId: self.alarmId)
             ExpoAlarmKitStorage.removeRescheduleConfig(alarmId: self.alarmId)
+        }
+
+        // The chain no longer depends on what happens next: a dismissed or
+        // failed unlock prompt only means the app stays closed.
+        NSLog("[ExpoAlarmKit] launch-dismiss successorArmed=%@ canContinue=%@", successorArmed ? "yes" : "no", systemContext.currentMode.canContinueInForeground ? "yes" : "no")
+        if systemContext.currentMode.canContinueInForeground {
+            do {
+                try await continueInForeground(nil, alwaysConfirm: false)
+                NSLog("[ExpoAlarmKit] launch-dismiss opened app")
+            } catch {
+                NSLog("[ExpoAlarmKit] launch-dismiss declined: %@", String(describing: error))
+            }
+        } else {
+            NSLog("[ExpoAlarmKit] launch-dismiss cannot open app from this mode")
         }
 
         return .result()
