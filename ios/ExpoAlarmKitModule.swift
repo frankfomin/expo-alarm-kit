@@ -3,6 +3,7 @@ import AlarmKit
 import ActivityKit
 import AppIntents
 import SwiftUI
+import UIKit
 
 // MARK: - Storage Keys
 private let alarmKeyPrefix = "ExpoAlarmKit.alarm:"
@@ -633,10 +634,17 @@ public struct AlarmDismissIntentWithLaunch: LiveActivityIntent {
             ExpoAlarmKitStorage.removeRescheduleConfig(alarmId: self.alarmId)
         }
 
-        // The chain no longer depends on what happens next: a dismissed or
-        // failed unlock prompt only means the app stays closed.
-        NSLog("[ExpoAlarmKit] launch-dismiss successorArmed=%@ canContinue=%@", successorArmed ? "yes" : "no", systemContext.currentMode.canContinueInForeground ? "yes" : "no")
-        if systemContext.currentMode.canContinueInForeground {
+        // Only open the app on an already unlocked phone. On a locked phone the
+        // foreground request puts up the passcode prompt, and while it is up
+        // AlarmKit refuses to arm the next rung, so a user who leaves the phone
+        // there exhausts the backstop ladder and the chain dies.
+        let deviceUnlocked = await MainActor.run {
+            UIApplication.shared.isProtectedDataAvailable
+        }
+        NSLog("[ExpoAlarmKit] launch-dismiss successorArmed=%@ unlocked=%@ canContinue=%@", successorArmed ? "yes" : "no", deviceUnlocked ? "yes" : "no", systemContext.currentMode.canContinueInForeground ? "yes" : "no")
+        if !deviceUnlocked {
+            NSLog("[ExpoAlarmKit] launch-dismiss phone locked, leaving app closed")
+        } else if systemContext.currentMode.canContinueInForeground {
             do {
                 try await continueInForeground(nil, alwaysConfirm: false)
                 NSLog("[ExpoAlarmKit] launch-dismiss opened app")
