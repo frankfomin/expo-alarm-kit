@@ -1,9 +1,10 @@
 import ExpoAlarmKitModule, {
+  AlarmCapacity,
   AuthorizationStatus,
   LaunchPayload,
 } from './ExpoAlarmKitModule';
 
-export { AuthorizationStatus, LaunchPayload };
+export { AlarmCapacity, AuthorizationStatus, LaunchPayload };
 
 /**
  * Configure the module with an App Group identifier.
@@ -87,17 +88,19 @@ export interface ScheduleAlarmOptions {
    */
   rescheduleDelaySeconds?: number;
   /**
-   * When set, a one-time backstop alarm is armed alongside this one, this many
-   * seconds after its fire time, and is cancelled only when a dismissal
-   * successfully arms the next alarm in the chain.
+   * A ladder of one-time backstop alarms, armed alongside this one at each of
+   * these offsets (seconds) past its fire time. The ladder is cancelled only
+   * when a dismissal successfully arms the next alarm in the chain.
    *
    * This exists because the dismiss-time reschedule runs in a background App
    * Intent that AlarmKit can refuse — most reliably while the device sits on
-   * the lock screen with the passcode prompt up. Without a backstop, that
-   * refusal ends the chain silently and the user sleeps through. Requires
-   * rescheduleDelaySeconds; ignored without it.
+   * the lock screen with the passcode prompt up — and because a volume button,
+   * the side button or the Ring/Silent switch quiet an alarm without
+   * dismissing it at all. Each rung survives one such silence, so the ladder's
+   * length is how long the alarm holds out. Requires rescheduleDelaySeconds;
+   * ignored without it.
    */
-  backstopDelaySeconds?: number;
+  backstopOffsetsSeconds?: number[];
 }
 
 /**
@@ -170,17 +173,19 @@ export interface ScheduleRepeatingAlarmOptions {
    */
   rescheduleDelaySeconds?: number;
   /**
-   * When set, a one-time backstop alarm is armed alongside this one, this many
-   * seconds after its fire time, and is cancelled only when a dismissal
-   * successfully arms the next alarm in the chain.
+   * A ladder of one-time backstop alarms, armed alongside this one at each of
+   * these offsets (seconds) past its fire time. The ladder is cancelled only
+   * when a dismissal successfully arms the next alarm in the chain.
    *
    * This exists because the dismiss-time reschedule runs in a background App
    * Intent that AlarmKit can refuse — most reliably while the device sits on
-   * the lock screen with the passcode prompt up. Without a backstop, that
-   * refusal ends the chain silently and the user sleeps through. Requires
-   * rescheduleDelaySeconds; ignored without it.
+   * the lock screen with the passcode prompt up — and because a volume button,
+   * the side button or the Ring/Silent switch quiet an alarm without
+   * dismissing it at all. Each rung survives one such silence, so the ladder's
+   * length is how long the alarm holds out. Requires rescheduleDelaySeconds;
+   * ignored without it.
    */
-  backstopDelaySeconds?: number;
+  backstopOffsetsSeconds?: number[];
 }
 
 /**
@@ -346,7 +351,7 @@ export function clearPendingRescheduledAlarms(): void {
 }
 
 /**
- * The backstop alarms currently armed (see `backstopDelaySeconds`).
+ * The backstop alarms currently armed (see `backstopOffsetsSeconds`).
  *
  * These are deliberately not alarms your app scheduled by id, so anything that
  * cancels alarms it does not recognise — an orphan sweep, a "stop everything"
@@ -354,6 +359,16 @@ export function clearPendingRescheduledAlarms(): void {
  */
 export function getBackstopAlarmIds(): string[] {
   return ExpoAlarmKitModule.getBackstopAlarmIds();
+}
+
+/**
+ * Development aid: AlarmKit's per-app alarm cap is undocumented. Arms
+ * throwaway one-time alarms a year out until AlarmKit refuses one or `limit`
+ * is reached, cancels every one of them, and reports how many it got and
+ * AlarmKit's refusal, if any.
+ */
+export async function measureAlarmCapacity(limit: number = 500): Promise<AlarmCapacity> {
+  return ExpoAlarmKitModule.measureAlarmCapacity(limit);
 }
 
 // Default export object for namespace-style usage
@@ -374,6 +389,7 @@ const ExpoAlarmKit = {
   getPendingRescheduledAlarms,
   clearPendingRescheduledAlarms,
   getBackstopAlarmIds,
+  measureAlarmCapacity,
 };
 
 export default ExpoAlarmKit;

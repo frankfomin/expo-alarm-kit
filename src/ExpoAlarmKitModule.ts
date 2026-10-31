@@ -24,7 +24,7 @@ export interface ScheduleAlarmOptions {
   tintColor?: string | null;
   snoozeDuration?: number | null;
   rescheduleDelaySeconds?: number | null;
-  backstopDelaySeconds?: number | null;
+  backstopOffsetsSeconds?: number[] | null;
 }
 
 export interface ScheduleRepeatingAlarmOptions {
@@ -46,7 +46,7 @@ export interface ScheduleRepeatingAlarmOptions {
   tintColor?: string | null;
   snoozeDuration?: number | null;
   rescheduleDelaySeconds?: number | null;
-  backstopDelaySeconds?: number | null;
+  backstopOffsetsSeconds?: number[] | null;
 }
 
 export interface ScheduleTimerOptions {
@@ -158,6 +158,12 @@ interface ExpoAlarmKitModuleType {
   getBackstopAlarmIds(): string[];
 
   /**
+   * Development aid: arms throwaway alarms a year out until AlarmKit refuses
+   * one or `limit` is reached, cancels them all, and reports how many it got.
+   */
+  measureAlarmCapacity(limit: number): Promise<AlarmCapacity>;
+
+  /**
    * Clear the pending rescheduled alarm mappings after they have been consumed.
    */
   clearPendingRescheduledAlarms(): void;
@@ -168,6 +174,11 @@ interface ExpoAlarmKitModuleType {
    * @returns The launch payload or null if not launched from an alarm.
    */
   getLaunchPayload(): LaunchPayload | null;
+}
+
+export interface AlarmCapacity {
+  count: number;
+  refusal: string;
 }
 
 export default requireNativeModule<ExpoAlarmKitModuleType>('ExpoAlarmKit');

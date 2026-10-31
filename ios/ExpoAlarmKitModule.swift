@@ -13,9 +13,10 @@ private let rescheduledKeyPrefix = "ExpoAlarmKit.rescheduled:"
 // alarmId -> id of the next backstop rung armed behind it. See armBackstopAlarm.
 private let backstopKeyPrefix = "ExpoAlarmKit.backstop:"
 
-/// Ceiling on the alarms armed for a single fire event: the alarm itself plus
-/// the backstop ladder behind it.
-private let maxAlarmsPerChain = 8
+/// Alarms per fire event armed by builds before `backstopOffsetsSeconds`: the
+/// alarm itself plus an evenly spaced ladder. Only used to expand the configs
+/// those builds stored.
+private let legacyAlarmsPerChain = 8
 
 // MARK: - App Group Storage Manager
 @available(iOS 26.0, *)
@@ -133,10 +134,24 @@ public class ExpoAlarmKitStorage {
     /// app's alarms table.
     public static func getAllBackstopIds() -> [String] {
         guard let defaults = sharedDefaults?.dictionaryRepresentation() else { return [] }
-        var ids: [String] = []
+        var nextRung: [String: String] = [:]
+        var stored = Set<String>()
         for (key, value) in defaults {
             if key.hasPrefix(backstopKeyPrefix), let id = value as? String {
-                ids.append(id)
+                nextRung[String(key.dropFirst(backstopKeyPrefix.count))] = id
+            } else if key.hasPrefix(alarmKeyPrefix) {
+                stored.insert(String(key.dropFirst(alarmKeyPrefix.count)))
+            }
+        }
+        let rungs = Set(nextRung.values)
+        var ids: [String] = []
+        for head in stored where !rungs.contains(head) {
+            var current = head
+            var seen: Set<String> = [head]
+            while let rung = nextRung[current], stored.contains(rung), !seen.contains(rung) {
+                ids.append(rung)
+                seen.insert(rung)
+                current = rung
             }
         }
         return ids
@@ -176,10 +191,10 @@ struct ScheduleAlarmOptions: Record {
     /// When set, dismissing the alarm without opening the app will automatically
     /// reschedule it this many seconds later. No app launch required.
     @Field var rescheduleDelaySeconds: Double?
-    /// When set, a one-time backstop alarm is armed this many seconds after
-    /// this alarm's own fire time, at schedule time rather than at dismiss
-    /// time. It fires unless a successful dismiss cancels it.
-    @Field var backstopDelaySeconds: Double?
+    /// Seconds past this alarm's own fire time at which one-time backstop
+    /// alarms are armed, at schedule time rather than at dismiss time. Each
+    /// fires unless a successful dismiss cancels the ladder first.
+    @Field var backstopOffsetsSeconds: [Double]?
 }
 
 @available(iOS 26.0, *)
@@ -201,9 +216,9 @@ struct ScheduleRepeatingAlarmOptions: Record {
     @Field var snoozeButtonColor: String?
     @Field var tintColor: String?
     @Field var snoozeDuration: Int?
-    /// When set, a one-time backstop alarm is armed this many seconds after
-    /// this alarm's next fire time. See ScheduleAlarmOptions.backstopDelaySeconds.
-    @Field var backstopDelaySeconds: Double?
+    /// Backstop ladder for the next occurrence, as seconds past its fire time.
+    /// See ScheduleAlarmOptions.backstopOffsetsSeconds.
+    @Field var backstopOffsetsSeconds: [Double]?
     /// When set, dismissing without opening the app reschedules a one-time alarm
     /// this many seconds later. Repeats until the user opens the app and cancels.
     @Field var rescheduleDelaySeconds: Double?
@@ -304,9 +319,11 @@ public struct PersistentAlarmConfig: Codable {
     let title: String
     let soundName: String?
     let rescheduleDelaySeconds: Double
-    /// nil disables the backstop. Optional so configs written by older builds
-    /// still decode.
+    /// Evenly spaced ladder stored by builds before `backstopOffsetsSeconds`.
+    /// Kept so their configs still decode and keep their ladder.
     let backstopDelaySeconds: Double?
+    /// nil or empty disables the backstop ladder.
+    let backstopOffsetsSeconds: [Double]?
     let stopButtonLabel: String?
     let stopButtonColor: String?
     let snoozeButtonLabel: String?
@@ -318,6 +335,12 @@ public struct PersistentAlarmConfig: Codable {
     let snoozePayload: String?
     let dismissPayload: String?
     let launchAppOnDismiss: Bool
+
+    var backstopOffsets: [Double] {
+        if let offsets = backstopOffsetsSeconds { return offsets }
+        guard let delay = backstopDelaySeconds, delay > 0 else { return [] }
+        return (1..<legacyAlarmsPerChain).map { delay * Double($0) }
+    }
 }
 
 /// Next occurrence of a weekly recurrence, so repeating alarms can store a real
@@ -435,6 +458,7 @@ private func successorConfig(from config: PersistentAlarmConfig) -> PersistentAl
         soundName: config.soundName,
         rescheduleDelaySeconds: config.rescheduleDelaySeconds,
         backstopDelaySeconds: config.backstopDelaySeconds,
+        backstopOffsetsSeconds: config.backstopOffsetsSeconds,
         stopButtonLabel: config.stopButtonLabel,
         stopButtonColor: config.stopButtonColor,
         snoozeButtonLabel: config.snoozeButtonLabel,
@@ -476,9 +500,9 @@ private func cancelBackstopChain(for alarmId: String) {
     }
 }
 
-/// Arms the safety net for `alarmId`: a ladder of one-time alarms at
-/// `backstopDelaySeconds` intervals past that alarm's own fire time, each of
-/// which goes off unless a successful dismiss cancels it first.
+/// Arms the safety net for `alarmId`: a ladder of one-time alarms at each of
+/// `backstopOffsets` past that alarm's own fire time, each of which goes off
+/// unless a successful dismiss cancels it first.
 ///
 /// The point is *when* this is armed. The dismiss-time reschedule runs from a
 /// background App Intent that AlarmKit can refuse — most reliably when the
@@ -498,7 +522,8 @@ private func cancelBackstopChain(for alarmId: String) {
 /// with it.
 @available(iOS 26.0, *)
 private func armBackstopAlarm(for alarmId: String, config: PersistentAlarmConfig, baseFireDate: Date) async {
-    guard let delay = config.backstopDelaySeconds, delay > 0 else { return }
+    let offsets = config.backstopOffsets
+    guard !offsets.isEmpty else { return }
 
     // Replace whatever is already armed for this alarm rather than stacking.
     cancelBackstopChain(for: alarmId)
@@ -506,8 +531,11 @@ private func armBackstopAlarm(for alarmId: String, config: PersistentAlarmConfig
     let backstopConfig = successorConfig(from: config)
     var previousId = alarmId
 
-    for rung in 1..<maxAlarmsPerChain {
-        let offset = delay * Double(rung)
+    for (index, offset) in offsets.enumerated() {
+        guard ExpoAlarmKitStorage.getRescheduleConfig(alarmId: alarmId) != nil else {
+            cancelBackstopChain(for: alarmId)
+            return
+        }
         let candidate = baseFireDate.addingTimeInterval(offset)
         let fireDate = candidate > Date() ? candidate : Date().addingTimeInterval(offset)
 
@@ -525,7 +553,13 @@ private func armBackstopAlarm(for alarmId: String, config: PersistentAlarmConfig
             )
         } catch {
             // Keep the rungs armed so far: a short ladder beats no ladder.
-            print("[ExpoAlarmKit] Failed to arm backstop rung \(rung) for \(alarmId): \(error)")
+            print("[ExpoAlarmKit] Failed to arm backstop rung \(index + 1) for \(alarmId): \(error)")
+            return
+        }
+
+        guard ExpoAlarmKitStorage.getRescheduleConfig(alarmId: alarmId) != nil else {
+            try? AlarmManager.shared.cancel(id: backstopId)
+            cancelBackstopChain(for: alarmId)
             return
         }
 
@@ -875,7 +909,8 @@ public class ExpoAlarmKitModule: Module {
                         title: options.title,
                         soundName: options.soundName,
                         rescheduleDelaySeconds: delay,
-                        backstopDelaySeconds: options.backstopDelaySeconds,
+                        backstopDelaySeconds: nil,
+                        backstopOffsetsSeconds: options.backstopOffsetsSeconds,
                         stopButtonLabel: options.stopButtonLabel,
                         stopButtonColor: options.stopButtonColor,
                         snoozeButtonLabel: options.snoozeButtonLabel,
@@ -1016,7 +1051,8 @@ public class ExpoAlarmKitModule: Module {
                         title: options.title,
                         soundName: options.soundName,
                         rescheduleDelaySeconds: delay,
-                        backstopDelaySeconds: options.backstopDelaySeconds,
+                        backstopDelaySeconds: nil,
+                        backstopOffsetsSeconds: options.backstopOffsetsSeconds,
                         stopButtonLabel: options.stopButtonLabel,
                         stopButtonColor: options.stopButtonColor,
                         snoozeButtonLabel: options.snoozeButtonLabel,
@@ -1133,19 +1169,20 @@ public class ExpoAlarmKitModule: Module {
                 return false
             }
             
+            var cancelled = true
             do {
                 try AlarmManager.shared.cancel(id: uuid)
-                // Otherwise the safety net outlives the alarm it was protecting
-                // and rings after the user has already woken up.
-                cancelBackstopChain(for: id)
-                ExpoAlarmKitStorage.removeAlarm(id: id)
-                ExpoAlarmKitStorage.removeLaunchAppOnDismiss(alarmId: id)
-                ExpoAlarmKitStorage.removeRescheduleConfig(alarmId: id)
-                return true
             } catch {
                 print("[ExpoAlarmKit] Failed to cancel alarm: \(error)")
-                return false
+                cancelled = false
             }
+            // Otherwise the safety net outlives the alarm it was protecting
+            // and rings after the user has already woken up.
+            cancelBackstopChain(for: id)
+            ExpoAlarmKitStorage.removeAlarm(id: id)
+            ExpoAlarmKitStorage.removeLaunchAppOnDismiss(alarmId: id)
+            ExpoAlarmKitStorage.removeRescheduleConfig(alarmId: id)
+            return cancelled
         }
         
         // MARK: - Get All Alarms
@@ -1214,6 +1251,56 @@ public class ExpoAlarmKitModule: Module {
         // table, so an orphan sweep must be told to spare them.
         Function("getBackstopAlarmIds") { () -> [String] in
             return ExpoAlarmKitStorage.getAllBackstopIds()
+        }
+
+        // MARK: - Measure Alarm Capacity
+        // Development aid. AlarmKit's per-app cap is undocumented, so this arms
+        // throwaway one-time alarms a year out until AlarmKit refuses one or
+        // `limit` is reached, cancels every one of them, and reports the count.
+        AsyncFunction("measureAlarmCapacity") { (limit: Int) async -> [String: Any] in
+            let fireDate = Date().addingTimeInterval(365 * 24 * 60 * 60)
+            let config = PersistentAlarmConfig(
+                originalAlarmId: "",
+                title: "Capacity probe",
+                soundName: nil,
+                rescheduleDelaySeconds: 0,
+                backstopDelaySeconds: nil,
+                backstopOffsetsSeconds: nil,
+                stopButtonLabel: nil,
+                stopButtonColor: nil,
+                snoozeButtonLabel: nil,
+                snoozeButtonColor: nil,
+                tintColor: nil,
+                snoozeDuration: nil,
+                doSnoozeIntent: false,
+                launchAppOnSnooze: false,
+                snoozePayload: nil,
+                dismissPayload: nil,
+                launchAppOnDismiss: false
+            )
+            var armed: [UUID] = []
+            var refusal = ""
+            while armed.count < limit {
+                let id = UUID()
+                do {
+                    try await AlarmManager.shared.schedule(
+                        id: id,
+                        configuration: buildChainAlarmConfiguration(
+                            config: config,
+                            alarmId: id.uuidString,
+                            fireDate: fireDate
+                        )
+                    )
+                } catch {
+                    refusal = String(describing: error)
+                    break
+                }
+                armed.append(id)
+            }
+            for id in armed {
+                try? AlarmManager.shared.cancel(id: id)
+            }
+            return ["count": armed.count, "refusal": refusal]
         }
 
         // MARK: - Clear Pending Rescheduled Alarms
